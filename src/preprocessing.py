@@ -9,67 +9,183 @@ from scipy import signal
 import librosa
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from scipy.signal import butter, cheby1, cheby2, ellip, lfilter, resample
 
 class HeartSoundPreprocessor:
     """Kalp sesi önişleme sınıfı"""
     
-    def __init__(self, target_sr=2000):
+    def __init__(self, target_sr=2000, filter_type="butter", filter_order=4):
         """
         Args:
             target_sr (int): Hedef örnekleme hızı
+            filter_type (str): Filtre tipi ('butter', 'cheby1', 'cheby2', 'ellip')
+            filter_order (int): Filtre derecesi
         """
         self.target_sr = target_sr
+        self.filter_type = filter_type
+        self.filter_order = filter_order
     
-    def resample(self, audio, original_sr):
+    def clean_audio(self, audio_data):
         """
-        Ses verisini hedef örnekleme hızına yeniden örnekle
+        Ses verisindeki NaN ve Infinity değerlerini temizle
         
         Args:
-            audio (numpy.ndarray): Ses verisi
-            original_sr (int): Orijinal örnekleme hızı
+            audio_data (numpy.ndarray): Ses verisi
             
         Returns:
-            numpy.ndarray: Yeniden örneklenmiş ses verisi
+            numpy.ndarray: Temizlenmiş ses verisi
         """
-        if original_sr != self.target_sr:
-            return librosa.resample(audio, orig_sr=original_sr, target_sr=self.target_sr)
-        return audio
+        # NaN değerleri 0 ile değiştir
+        if np.isnan(audio_data).any():
+            print("UYARI: Ses verisinde NaN değerleri tespit edildi ve temizlendi.")
+            audio_data = np.nan_to_num(audio_data, nan=0.0)
+        
+        # Infinity değerleri maksimum float değeri ile değiştir
+        if np.isinf(audio_data).any():
+            print("UYARI: Ses verisinde Infinity değerleri tespit edildi ve temizlendi.")
+            audio_data = np.nan_to_num(audio_data, posinf=np.finfo(np.float32).max, neginf=np.finfo(np.float32).min)
+        
+        return audio_data
     
-    def normalize(self, audio):
+    def filter_audio(self, audio_data, fs, lowcut=25, highcut=400):
         """
-        Ses verisini normalize et
+        Ses verisini bant geçiren filtre ile filtrele
         
         Args:
-            audio (numpy.ndarray): Ses verisi
-            
-        Returns:
-            numpy.ndarray: Normalize edilmiş ses verisi
-        """
-        if np.std(audio) > 0:
-            return (audio - np.mean(audio)) / np.std(audio)
-        return audio
-    
-    def bandpass_filter(self, audio, lowcut=25, highcut=400):
-        """
-        Bandpass filtre uygula
-        
-        Args:
-            audio (numpy.ndarray): Ses verisi
-            lowcut (int): Alt kesim frekansı (Hz)
-            highcut (int): Üst kesim frekansı (Hz)
+            audio_data (numpy.ndarray): Ses verisi
+            fs (float): Örnekleme hızı
+            lowcut (float): Alçak kesim frekansı
+            highcut (float): Yüksek kesim frekansı
             
         Returns:
             numpy.ndarray: Filtrelenmiş ses verisi
         """
-        nyquist = 0.5 * self.target_sr
-        low = lowcut / nyquist
-        high = highcut / nyquist
+        # Temizle
+        audio_data = self.clean_audio(audio_data)
         
-        # Butterworth bandpass filtre tasarımı
-        b, a = signal.butter(4, [low, high], btype='band')
+        # Normalize, eğer verinin bir aralığı varsa
+        if np.ptp(audio_data) > 0:
+            audio_data = audio_data / np.max(np.abs(audio_data))
         
-        # Filtreyi uygula
-        return signal.filtfilt(b, a, audio)
+        # Nyquist frekansı
+        nyq = 0.5 * fs
+        low = lowcut / nyq
+        high = highcut / nyq
+        
+        # Bant geçiren filtre tasarımı
+        if self.filter_type == "butter":
+            b, a = butter(self.filter_order, [low, high], btype='band')
+        elif self.filter_type == "cheby1":
+            b, a = cheby1(self.filter_order, 0.5, [low, high], btype='band')
+        elif self.filter_type == "cheby2":
+            b, a = cheby2(self.filter_order, 30, [low, high], btype='band')
+        elif self.filter_type == "ellip":
+            b, a = ellip(self.filter_order, 0.5, 30, [low, high], btype='band')
+        else:
+            raise ValueError(f"Bilinmeyen filtre tipi: {self.filter_type}")
+        
+        # Filtreleme
+        try:
+            y = lfilter(b, a, audio_data)
+            return y
+        except Exception as e:
+            print(f"Filtreleme sırasında hata oluştu: {str(e)}")
+            return audio_data  # Hata durumunda orijinal veriyi döndür
+    
+    def resample(self, audio_data, fs):
+        """
+        Ses verisini yeniden örnekle
+        
+        Args:
+            audio_data (numpy.ndarray): Ses verisi
+            fs (float): Örnekleme hızı
+            
+        Returns:
+            numpy.ndarray: Yeniden örneklenmiş ses verisi
+        """
+        if fs == self.target_sr:
+            return audio_data
+        
+        # Temizle
+        audio_data = self.clean_audio(audio_data)
+        
+        # Yeniden örnekleme faktörü
+        factor = self.target_sr / fs
+        
+        # Yeni uzunluk
+        new_length = int(len(audio_data) * factor)
+        
+        # Yeniden örnekle
+        try:
+            resampled = resample(audio_data, new_length)
+            return resampled
+        except Exception as e:
+            print(f"Yeniden örnekleme sırasında hata oluştu: {str(e)}")
+            # Hata durumunda, basit bir lineer interpolasyon yaparak yeniden örnekle
+            x_old = np.linspace(0, 1, len(audio_data))
+            x_new = np.linspace(0, 1, new_length)
+            resampled = np.interp(x_new, x_old, audio_data)
+            return resampled
+    
+    def process_audio(self, audio_data, fs):
+        """
+        Ses verisini işle: filtrele, yeniden örnekle
+        
+        Args:
+            audio_data (numpy.ndarray): Ses verisi
+            fs (float): Örnekleme hızı
+            
+        Returns:
+            numpy.ndarray: İşlenmiş ses verisi
+        """
+        # Temizlik kontrolü ve temizleme
+        audio_data = self.clean_audio(audio_data)
+        
+        # Filtreleme
+        filtered_data = self.filter_audio(audio_data, fs)
+        
+        # Yeniden örnekleme
+        resampled_data = self.resample(filtered_data, fs)
+        
+        # Son temizlik
+        clean_data = self.clean_audio(resampled_data)
+        
+        return clean_data
+    
+    def segment(self, audio_data, segment_length_sec, overlap_ratio=0.5):
+        """
+        Ses verisini segmentlere ayır
+        
+        Args:
+            audio_data (numpy.ndarray): Ses verisi
+            segment_length_sec (float): Segment uzunluğu (saniye)
+            overlap_ratio (float): Örtüşme oranı (0-1 arası)
+            
+        Returns:
+            list: Ses segmentleri listesi
+        """
+        # Segment uzunluğu (örnek sayısı)
+        segment_length = int(segment_length_sec * self.target_sr)
+        
+        # Adım boyutu (örnek sayısı)
+        step_size = int(segment_length * (1 - overlap_ratio))
+        
+        segments = []
+        
+        # Ses verisini segmentlere ayır
+        for start in range(0, len(audio_data) - segment_length + 1, step_size):
+            segment = audio_data[start:start + segment_length].copy()
+            
+            # Segmenti temizle
+            segment = self.clean_audio(segment)
+            
+            # Normalize
+            if np.ptp(segment) > 0:  # Eğer segment sabit değilse
+                segment = segment / np.max(np.abs(segment))
+            
+            segments.append(segment)
+        
+        return segments
     
     def denoise(self, audio, n_grad_freq=2, n_grad_time=4, n_fft=2048,
                 win_length=2048, hop_length=512, n_std_thresh=1.5):
@@ -113,66 +229,6 @@ class HeartSoundPreprocessor:
         
         return audio_denoised
     
-    def segment(self, audio, segment_length_sec=3.0, overlap_ratio=0.5):
-        """
-        Ses verisini segmentlere ayır
-        
-        Args:
-            audio (numpy.ndarray): Ses verisi
-            segment_length_sec (float): Segment uzunluğu (saniye)
-            overlap_ratio (float): Örtüşme oranı (0-1 arası)
-            
-        Returns:
-            list: Segment listesi
-        """
-        # Segment uzunluğunu örnekleme sayısına dönüştür
-        segment_length = int(segment_length_sec * self.target_sr)
-        
-        # Örtüşme miktarını hesapla
-        hop_length = int(segment_length * (1 - overlap_ratio))
-        
-        # Segment sayısını hesapla
-        n_segments = 1 + (len(audio) - segment_length) // hop_length
-        
-        segments = []
-        for i in range(n_segments):
-            start = i * hop_length
-            end = start + segment_length
-            
-            # Eğer segment, ses verisinin sonunu aşıyorsa döngüyü sonlandır
-            if end > len(audio):
-                break
-                
-            segment = audio[start:end]
-            segments.append(segment)
-        
-        return segments
-    
-    def process_audio(self, audio, original_sr):
-        """
-        Ses verisine tüm işlemleri uygula
-        
-        Args:
-            audio (numpy.ndarray): Ses verisi
-            original_sr (int): Orijinal örnekleme hızı
-            
-        Returns:
-            numpy.ndarray: İşlenmiş ses verisi
-        """
-        # Örnekleme hızını değiştir
-        audio_resampled = self.resample(audio, original_sr)
-        
-        # Normalize et
-        audio_normalized = self.normalize(audio_resampled)
-        
-        # Bandpass filtre uygula
-        audio_filtered = self.bandpass_filter(audio_normalized)
-        
-        # Gürültü azalt
-        audio_denoised = self.denoise(audio_filtered)
-        
-        return audio_denoised
-    
     def plot_preprocessing_steps(self, audio, original_sr):
         """
         Önişleme adımlarını görselleştir
@@ -185,10 +241,10 @@ class HeartSoundPreprocessor:
         audio_resampled = self.resample(audio, original_sr)
         
         # Normalize et
-        audio_normalized = self.normalize(audio_resampled)
+        audio_normalized = self.clean_audio(audio_resampled)
         
         # Bandpass filtre uygula
-        audio_filtered = self.bandpass_filter(audio_normalized)
+        audio_filtered = self.filter_audio(audio_normalized, original_sr)
         
         # Gürültü azalt
         audio_denoised = self.denoise(audio_filtered)

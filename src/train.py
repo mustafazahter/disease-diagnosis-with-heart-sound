@@ -40,6 +40,19 @@ def preprocess_data(data_dir, segment_length_sec=3.0, overlap_ratio=0.5, target_
     metadata = loader.load_metadata()
     records = loader.load_records_list()
     
+    # Metadata ya da kayıt listesi boşsa hata ver
+    if metadata is None or records is None:
+        print("HATA: Metadata veya kayıt listesi yüklenemedi!")
+        return np.array([]), np.array([]), []
+    
+    # Metadata sütunlarını kontrol et
+    required_columns = ['Patient ID', 'Murmur']
+    for col in required_columns:
+        if col not in metadata.columns:
+            print(f"HATA: Metadata dosyasında gerekli sütun bulunamadı: {col}")
+            print(f"Mevcut sütunlar: {metadata.columns.tolist()}")
+            return np.array([]), np.array([]), []
+    
     # Önişleyici oluştur
     preprocessor = HeartSoundPreprocessor(target_sr=target_sr)
     
@@ -47,37 +60,112 @@ def preprocess_data(data_dir, segment_length_sec=3.0, overlap_ratio=0.5, target_
     all_labels = []
     segment_record_map = []  # Her segmentin hangi kayda ait olduğunu tut
     
+    # Eşleştirme istatistikleri
+    matched_count = 0
+    unmatched_count = 0
+    failed_audio_count = 0
+    success_audio_count = 0
+    
+    print(f"Toplam kayıt sayısı: {len(records)}")
+    print(f"İlk 5 kayıt: {records[:5]}")
+    print(f"İlk 5 hasta ID: {metadata['Patient ID'].values[:5]}")
+    
     # Her kayıt için
     for record_name in records:
-        # Metadata'dan murmur bilgisini al
-        record_id = record_name.split('_')[0]  # Kayıt ID'sini çıkar
-        
-        # Metadata'da kayıt varsa etiketini al
-        if record_id in metadata['patient_id'].values:
-            record_meta = metadata[metadata['patient_id'] == record_id].iloc[0]
-            murmur_label = 1 if record_meta['murmur'] == 'Present' else 0
+        try:
+            # Metadata'dan murmur bilgisini al
+            # Kayıt ID'sini doğru şekilde çıkar
+            # Örnek: 'training_data/2530_AV' -> '2530'
+            if '/' in record_name:
+                # 'training_data/2530_AV' formatındaysa
+                record_id = record_name.split('/')[-1].split('_')[0]
+            else:
+                # '2530_AV' formatındaysa
+                record_id = record_name.split('_')[0]
             
-            # Ses verisini yükle
-            audio_data, fs = loader.load_audio(record_name)
+            # Debug bilgisi
+            if matched_count < 5 and unmatched_count < 5:
+                print(f"Kayıt adı: {record_name}, Çıkarılan ID: {record_id}")
             
-            if audio_data is not None:
-                # Ses verisini işle
-                processed_audio = preprocessor.process_audio(audio_data, fs)
+            # Metadata'da kayıt varsa etiketini al
+            if record_id in metadata['Patient ID'].values.astype(str):
+                record_meta = metadata[metadata['Patient ID'].astype(str) == record_id].iloc[0]
+                murmur_label = 1 if record_meta['Murmur'] == 'Present' else 0
                 
-                # Ses verisini segmentlere ayır
-                segments = preprocessor.segment(processed_audio, segment_length_sec, overlap_ratio)
+                # Ses verisini yükle
+                audio_data, fs = loader.load_audio(record_name)
                 
-                # Segmentleri ve etiketleri depola
-                for segment in segments:
-                    all_segments.append(segment)
-                    all_labels.append(murmur_label)
-                    segment_record_map.append(record_name)
-                
-                print(f"Kayıt işlendi: {record_name}, Murmur: {'Var' if murmur_label == 1 else 'Yok'}, Segment sayısı: {len(segments)}")
+                if audio_data is not None:
+                    try:
+                        # NaN veya Infinity değerleri kontrolü
+                        if np.isnan(audio_data).any() or np.isinf(audio_data).any():
+                            print(f"UYARI: {record_name} kaydında NaN veya Infinity değerleri var. Temizleniyor...")
+                            audio_data = np.nan_to_num(audio_data)
+                            
+                        # Ses verisini işle
+                        processed_audio = preprocessor.process_audio(audio_data, fs)
+                        
+                        # Tekrar NaN veya Infinity kontrolü
+                        if np.isnan(processed_audio).any() or np.isinf(processed_audio).any():
+                            print(f"UYARI: {record_name} kaydı işlendikten sonra hala NaN veya Infinity değerleri var. Bu kayıt atlanıyor.")
+                            failed_audio_count += 1
+                            continue
+                        
+                        # Ses verisini segmentlere ayır
+                        segments = preprocessor.segment(processed_audio, segment_length_sec, overlap_ratio)
+                        
+                        # Son kontrol: segmentlerde NaN veya Infinity var mı?
+                        valid_segments = []
+                        for segment in segments:
+                            if not np.isnan(segment).any() and not np.isinf(segment).any():
+                                valid_segments.append(segment)
+                            else:
+                                print(f"UYARI: {record_name} kaydının bir segmentinde NaN veya Infinity değerleri var. Bu segment atlanıyor.")
+                        
+                        if valid_segments:
+                            # Segmentleri ve etiketleri depola
+                            for segment in valid_segments:
+                                all_segments.append(segment)
+                                all_labels.append(murmur_label)
+                                segment_record_map.append(record_name)
+                            
+                            print(f"Kayıt işlendi: {record_name}, Murmur: {'Var' if murmur_label == 1 else 'Yok'}, Segment sayısı: {len(valid_segments)}")
+                            matched_count += 1
+                            success_audio_count += 1
+                        else:
+                            print(f"UYARI: {record_name} kaydından geçerli segment oluşturulamadı.")
+                            failed_audio_count += 1
+                    except Exception as e:
+                        print(f"HATA: Kayıt işlenirken bir sorun oluştu: {record_name} - {str(e)}")
+                        failed_audio_count += 1
+                else:
+                    print(f"UYARI: Ses verisi yüklenemedi: {record_name}")
+                    failed_audio_count += 1
+            else:
+                unmatched_count += 1
+                if unmatched_count <= 5:  # Sadece ilk 5 eşleşmeyen kaydı göster
+                    print(f"UYARI: Kayıt ID'si metadata'da bulunamadı: {record_id} ({record_name})")
+        except Exception as e:
+            print(f"HATA: Kayıt işlenirken bir sorun oluştu: {record_name} - {str(e)}")
+            failed_audio_count += 1
     
-    print(f"Toplam segment sayısı: {len(all_segments)}")
+    # İstatistikleri görüntüle
+    print("\nEşleştirme İstatistikleri:")
+    print(f"Toplam kayıt sayısı: {len(records)}")
+    print(f"Metadata ile eşleşen kayıt sayısı: {matched_count}")
+    print(f"Metadata ile eşleşmeyen kayıt sayısı: {unmatched_count}")
+    print(f"Ses verisi yüklenip işlenen kayıt sayısı: {success_audio_count}")
+    print(f"Ses verisi yüklenemeyen veya işlenemeyen kayıt sayısı: {failed_audio_count}")
+    
+    print(f"\nToplam segment sayısı: {len(all_segments)}")
     print(f"Pozitif segment sayısı: {sum(all_labels)}")
     print(f"Negatif segment sayısı: {len(all_labels) - sum(all_labels)}")
+    
+    if len(all_segments) == 0:
+        print("\nDİKKAT: Hiç segment oluşturulamadı. Lütfen kontrol edin:")
+        print("1. Kayıt ID'leri ile metadata'daki ID'ler eşleşiyor mu?")
+        print("2. Ses dosyaları (.hea ve .dat) doğru konumda mı?")
+        print("3. Metadata dosyasındaki sütun isimleri ve değerleri doğru formatta mı?")
     
     return np.array(all_segments), np.array(all_labels), segment_record_map
 
@@ -96,6 +184,11 @@ def extract_features(segments, labels, segment_record_map, feature_type='raw_wav
         tuple: (öznitelikler, etiketler)
     """
     print(f"Öznitelik çıkarılıyor: {feature_type}")
+    
+    # Eğer segment listesi boşsa, hata vermeden boş diziler döndür
+    if len(segments) == 0:
+        print("UYARI: Hiç segment bulunamadı. Veri yükleme ve önişleme adımlarını kontrol edin.")
+        return np.array([]), np.array([])
     
     if feature_type == 'raw_waveform':
         # Ham ses dalgaformunu kullan (CNN modeli için)
@@ -297,7 +390,8 @@ def main():
     """Ana fonksiyon"""
     parser = argparse.ArgumentParser(description='Kalp sesi sınıflandırma modeli eğitimi')
     
-    parser.add_argument('--data_dir', type=str, default='../data',
+    parser.add_argument('--data_dir', type=str, 
+                      default='/content/disease-diagnosis-with-heart-sound/data/the-circor-digiscope-phonocardiogram-dataset-1.0.3/',
                       help='Veri klasörü yolu')
     parser.add_argument('--model_type', type=str, default='cnn',
                       choices=['mlp', 'cnn', 'lstm', 'hybrid'],
@@ -325,6 +419,19 @@ def main():
         overlap_ratio=args.overlap_ratio
     )
     
+    # Segment sayısı kontrolü
+    if len(segments) == 0:
+        print("HATA: Hiç ses segmenti bulunamadı. İşlem durduruluyor.")
+        print("Olası sebepler:")
+        print("1. Ses dosyaları (.hea ve .dat) bulunamıyor olabilir")
+        print("2. Kayıt ID'leri ile metadata arasında eşleşme sorunu olabilir")
+        print("3. Metadata dosyasındaki sütun isimleri beklenen formatta olmayabilir")
+        print("\nLütfen aşağıdaki adımları kontrol edin:")
+        print("- Ses dosyaları ve metadata doğru konumda mı?")
+        print("- RECORDS dosyası doğru kayıt ID'lerini içeriyor mu?")
+        print("- data_loader.py dosyasını önce tek başına çalıştırıp veri yüklemeyi test edin")
+        return
+    
     # Öznitelikleri çıkar
     X, y = extract_features(
         segments,
@@ -332,6 +439,11 @@ def main():
         segment_record_map,
         feature_type=args.feature_type
     )
+    
+    # Öznitelik sayısı kontrolü
+    if len(X) == 0:
+        print("HATA: Öznitelik çıkarma işlemi başarısız oldu. İşlem durduruluyor.")
+        return
     
     # Veri setlerini hazırla
     X_train, X_val, X_test, y_train, y_val, y_test = prepare_data_splits(
